@@ -81,6 +81,22 @@ Use these exact target names when using bundled robots:
 
 The interactive viewer lists discovered targets in its robot selector. Headless conversion reads the target from the `retarget_target` field in the converter configuration.
 
+### Optional deploy joint-limit cost
+
+The stock IK joint-limit objective penalizes values *outside* the model limits, and the output is finally hard-clamped to the model limits. To penalize approach to the deployed stop instead, set `retarget_config_overrides` in the converter JSON (or pass these keys directly as `retarget_config` to `SomaRetargetingPipeline`):
+
+```json
+"retarget_config_overrides": {
+  "deploy_joint_limit_barrier": true,
+  "deploy_joint_limit_barrier_weight": 40.0,
+  "deploy_joint_limit_margins": {"ankle": 0.05, "knee": 0.03, "default": 0.02}
+}
+```
+
+The squared-hinge IK cost is zero within `[deploy_lower + margin, deploy_upper - margin]`; both base and limb-stabilization IK use its exact analytic derivative. A final hard clip at the deploy stop remains the safety net. The flag defaults to `false` and preserves existing behavior. The limits are name-matched against frozen copies of the ProtoMotions `deployment/robot/g1.py` and `h1_2.py` position contracts. A target whose joint names do not match the contract is refused. The bundled robot assets include `unitree_g1` but **not** `h1_2`; use an externally registered H1_2 target with the matching name/configuration to exercise H1_2. Update the mirrored contract when deployment limits change.
+
+To verify the G1 path on CPU, run `uv run --no-sync python tools/smoke_joint_limit_barrier.py`. The paired BVH benchmark is `tools/benchmark_joint_limit_barrier.py --source /path/to/kimodo-bvh --out /path/to/result.json --count 50 --post-processing` and reports limit hits, source-target scaled keypoint errors, kinematic contact proxy agreement, foot slide and IK time. Contact proxy is not a simulated physics contact measurement.
+
 ## Command convention in this guide
 
 Run commands from the repository root. The documentation uses `uv` because it creates and manages the project environment without requiring you to activate it manually:
