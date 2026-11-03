@@ -9,11 +9,11 @@ class JointLimitClamper:
     """
     A utility class for clamping joint coordinates to their specified limits.
     """
-    def __init__(self, model):
+    def __init__(self, model, lower=None, upper=None):
         self.n_dofs = model.joint_dof_count
         self.n_coords = model.joint_coord_count
-        self.joint_limit_lower = model.joint_limit_lower
-        self.joint_limit_upper = model.joint_limit_upper
+        self.joint_limit_lower = model.joint_limit_lower if lower is None else lower
+        self.joint_limit_upper = model.joint_limit_upper if upper is None else upper
 
         dof_to_coord_np = np.full(self.n_dofs, -1, dtype=np.int32)
         q_start_np = model.joint_q_start.numpy()

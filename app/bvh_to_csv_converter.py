@@ -324,7 +324,10 @@ class Viewer:
         if (retarget_solver == 'Newton'):
             import soma_retargeter.pipelines.soma_retargeting_pipeline as soma_retargeting_pipeline
             try:
-                pipeline = soma_retargeting_pipeline.SomaRetargetingPipeline(self.skeleton, retarget_source, retarget_target)
+                retarget_config = pipeline_utils.get_retargeter_config(retarget_source, retarget_target)
+                retarget_config.update(self.config.get("retarget_config_overrides", {}))
+                pipeline = soma_retargeting_pipeline.SomaRetargetingPipeline(
+                    self.skeleton, retarget_source, retarget_target, retarget_config)
             except Exception as error:
                 message = f"[ERROR]: {error}"
                 print(message)
@@ -549,8 +552,10 @@ class Viewer:
         if (retarget_solver == 'Newton'):
             import soma_retargeter.pipelines.soma_retargeting_pipeline as soma_retargeting_pipeline
             try:
+                retarget_config = pipeline_utils.get_retargeter_config(retarget_source, retarget_target)
+                retarget_config.update(self.config.get("retarget_config_overrides", {}))
                 retarget_pipeline = soma_retargeting_pipeline.SomaRetargetingPipeline(
-                    bvh_skeleton, retarget_source, retarget_target)
+                    bvh_skeleton, retarget_source, retarget_target, retarget_config)
             except Exception as error:
                 print(f"[ERROR]: {error}")
                 exit(-1)

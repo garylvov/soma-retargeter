@@ -28,6 +28,8 @@ from soma_retargeter.robotics.human_to_robot_scaler import HumanToRobotScaler
 from soma_retargeter.robotics.csv_animation_buffer import CSVAnimationBuffer
 from soma_retargeter.pipelines.limb_stabilizer import LimbStabilizer
 from soma_retargeter.pipelines.joint_limit_clamper import JointLimitClamper
+from soma_retargeter.pipelines.ik_objectives import IKJointLimitBarrier
+from soma_retargeter.pipelines.deploy_joint_limits import DEPLOY_LIMITS, margin_for_joint
 from soma_retargeter.animation.contact_phase import (
     load_authored_foot_landmark_model,
     build_heuristic_foot_landmark_model,
@@ -99,6 +101,10 @@ class SomaRetargetingPipeline:
 
         self.ik_iterations = retargeter_config.get('ik_iterations', _DEFAULT_IK_SOLVER_ITERATIONS)
         self.joint_limit_weight = retargeter_config.get('joint_limit_weight', _DEFAULT_JOINT_LIMIT_OBJECTIVE_WEIGHT)
+        self.deploy_joint_limit_barrier = retargeter_config.get('deploy_joint_limit_barrier', False)
+        self.deploy_joint_limit_barrier_weight = retargeter_config.get('deploy_joint_limit_barrier_weight', 40.0)
+        self.deploy_joint_limit_margins = {"ankle": 0.05, "knee": 0.03, "default": 0.02}
+        self.deploy_joint_limit_margins.update(retargeter_config.get('deploy_joint_limit_margins', {}))
         self.smooth_joint_filter_weight = retargeter_config.get('smooth_joint_filter_weight', _DEFAULT_SMOOTH_JOINT_FILTER_OBJECTIVE_WEIGHT)
         self.post_processing_enabled = retargeter_config.get('enable_post_processing', True)
         self.self_penetration_weight = retargeter_config.get('self_penetration_weight', _DEFAULT_SELF_PENETRATION_OBJECTIVE_WEIGHT)
@@ -145,7 +151,10 @@ class SomaRetargetingPipeline:
         self._feet_effector_scale = self.human_robot_scaler.human_scale_ratio
         self._feet_effector_ik_offsets = np.asarray(target_offsets[self._feet_effector_indices], dtype=np.float32)
 
-        self.joint_limit_clamper = JointLimitClamper(self.ik_model)
+        if self.deploy_joint_limit_barrier:
+            self._setup_deploy_joint_limits()
+        else:
+            self.joint_limit_clamper = JointLimitClamper(self.ik_model)
 
         zero_pose_path = pipeline_utils.get_source_zero_pose_asset_path(self.source_type)
         init_skel, init_anim = bvh_utils.load_bvh(zero_pose_path)
@@ -165,8 +174,13 @@ class SomaRetargetingPipeline:
                 raise ValueError(
                     "enable_post_processing is set but post_processing config is missing "
                     "or does not contain a 'limb_stabilizer' section")
+            deploy_limits = None
+            if self.deploy_joint_limit_barrier:
+                deploy_limits = (self.deploy_joint_limit_lower, self.deploy_joint_limit_upper,
+                                 self.deploy_joint_limit_margin, self.deploy_joint_limit_barrier_weight)
             self.limb_stabilizer = LimbStabilizer(
-                self.target_type, self.limb_target_ik_names, self.limb_effector_indices, self.post_processing_config["limb_stabilizer"])
+                self.target_type, self.limb_target_ik_names, self.limb_effector_indices,
+                self.post_processing_config["limb_stabilizer"], deploy_joint_limits=deploy_limits)
 
         self.auto_detect_contacts: bool = retargeter_config.get(
             'auto_detect_contacts',
@@ -419,6 +433,8 @@ class SomaRetargetingPipeline:
         print(f"[INFO]\t  Constraint Stabilization Frame Count: {self.num_stabilization_frames}")
         print(f"[INFO]\t  IK Solver Iterations: {self.ik_iterations}")
         print(f"[INFO]\t  Joint Limit Objective Weight: {self.joint_limit_weight}")
+        if self.deploy_joint_limit_barrier:
+            print(f"[INFO]\t  Deploy Joint Limit Barrier Weight: {self.deploy_joint_limit_barrier_weight}")
         print(f"[INFO]\t  Smooth Joint Filter Objective Weight: {self.smooth_joint_filter_weight}")
 
         if self._needs_contact_processing() and self.plant_subsegment_results and not self.plant_blenders:
@@ -439,7 +455,7 @@ class SomaRetargetingPipeline:
         ) = self._create_ik_objectives(num_envs, model, state)
 
         extra_objectives = []
-        if self.joint_limit_weight > 0.0:
+        if self.deploy_joint_limit_barrier or self.joint_limit_weight > 0.0:
             extra_objectives.append(joint_limit_objective)
         if self.smooth_joint_filter_weight > 0.0:
             extra_objectives.append(smooth_joint_filter_objective)
@@ -512,6 +528,45 @@ class SomaRetargetingPipeline:
 
         return [CSVAnimationBuffer.create_from_raw_data(joint_q_frames_wp[i].numpy(), self.input_sample_rates[i])
             for i in range(num_envs)]
+
+    def _setup_deploy_joint_limits(self):
+        """Resolve the deploy contract by joint name, rejecting missing/mismatched joints."""
+        contract = DEPLOY_LIMITS.get(self.target_type)
+        if contract is None:
+            raise ValueError(f"No deploy joint-limit contract for target {self.target_type!r}")
+        if self.deploy_joint_limit_barrier_weight <= 0.0:
+            raise ValueError("deploy_joint_limit_barrier_weight must be positive")
+        if any(not np.isfinite(v) or v <= 0 for v in self.deploy_joint_limit_margins.values()):
+            raise ValueError("deploy_joint_limit_margins must be positive finite radians")
+
+        names = [newton_utils.get_name_from_label(label) for label in self.ik_model.joint_label]
+        starts = self.ik_model.joint_qd_start.numpy()
+        dims = self.ik_model.joint_dof_dim.numpy()
+        lower = self.ik_model.joint_limit_lower.numpy().copy()
+        upper = self.ik_model.joint_limit_upper.numpy().copy()
+        margins = np.zeros_like(lower)
+        matched = set()
+        for index, name in enumerate(names):
+            if name not in contract:
+                continue
+            count = int(sum(dims[index]))
+            if count != 1 or name in matched:
+                raise ValueError(f"Deploy joint {name} must have exactly one unique DoF, got {count}")
+            matched.add(name)
+            dof = starts[index]
+            lo, hi = contract[name]
+            margin = margin_for_joint(name, self.deploy_joint_limit_margins)
+            if lo + margin >= hi - margin:
+                raise ValueError(f"Deploy margin too large for {name}")
+            lower[dof], upper[dof], margins[dof] = lo, hi, margin
+        missing = contract.keys() - matched
+        if missing:
+            raise ValueError(f"Deploy contract joints not found in {self.target_type}: {sorted(missing)}")
+        self.deploy_joint_limit_lower = wp.array(lower, dtype=wp.float32)
+        self.deploy_joint_limit_upper = wp.array(upper, dtype=wp.float32)
+        self.deploy_joint_limit_margin = wp.array(margins, dtype=wp.float32)
+        self.joint_limit_clamper = JointLimitClamper(
+            self.ik_model, self.deploy_joint_limit_lower, self.deploy_joint_limit_upper)
 
     def _build_model(self, num_envs: int):
         """Build a Newton model containing ``num_envs`` robot copies for batched simulation.
@@ -594,10 +649,15 @@ class SomaRetargetingPipeline:
             num_envs, self.mapped_body_link_pos_data, pos_targets)
         rotation_objectives = IKSolver.make_rotation_objectives(
             num_envs, self.mapped_body_link_rot_data, rot_targets)
-        joint_limit_objective = ik.IKObjectiveJointLimit(
-            joint_limit_lower=self.ik_model.joint_limit_lower,
-            joint_limit_upper=self.ik_model.joint_limit_upper,
-            weight=self.joint_limit_weight)
+        if self.deploy_joint_limit_barrier:
+            joint_limit_objective = IKJointLimitBarrier(
+                self.deploy_joint_limit_lower, self.deploy_joint_limit_upper,
+                self.deploy_joint_limit_margin, self.deploy_joint_limit_barrier_weight)
+        else:
+            joint_limit_objective = ik.IKObjectiveJointLimit(
+                joint_limit_lower=self.ik_model.joint_limit_lower,
+                joint_limit_upper=self.ik_model.joint_limit_upper,
+                weight=self.joint_limit_weight)
         smooth_joint_filter_objective = IKSolver.make_smooth_joint_filter(
             self.ik_model,
             weight=0.0,

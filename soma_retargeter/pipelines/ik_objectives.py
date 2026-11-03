@@ -89,6 +89,82 @@ def _smooth_joint_filter_jac_analytic(
     jacobian[problem, start_idx + active_idx, dof_idx] = weight[0] * mask
 
 
+@wp.kernel
+def _joint_barrier_residuals(
+    joint_q: wp.array2d(dtype=wp.float32),
+    lower: wp.array1d(dtype=wp.float32),
+    upper: wp.array1d(dtype=wp.float32),
+    margins: wp.array1d(dtype=wp.float32),
+    dof_to_coord: wp.array1d(dtype=wp.int32),
+    weight: wp.float32,
+    start_idx: int,
+    residuals: wp.array2d(dtype=wp.float32),
+):
+    problem, dof = wp.tid()
+    coord = dof_to_coord[dof]
+    if coord < 0:
+        return
+    q = joint_q[problem, coord]
+    lo = lower[dof] + margins[dof]
+    hi = upper[dof] - margins[dof]
+    residuals[problem, start_idx + dof] = weight * (wp.max(0.0, q - hi) - wp.max(0.0, lo - q))
+
+
+@wp.kernel
+def _joint_barrier_jacobian(
+    joint_q: wp.array2d(dtype=wp.float32),
+    lower: wp.array1d(dtype=wp.float32),
+    upper: wp.array1d(dtype=wp.float32),
+    margins: wp.array1d(dtype=wp.float32),
+    dof_to_coord: wp.array1d(dtype=wp.int32),
+    weight: wp.float32,
+    start_idx: int,
+    jacobian: wp.array3d(dtype=wp.float32),
+):
+    problem, dof = wp.tid()
+    coord = dof_to_coord[dof]
+    if coord < 0:
+        return
+    q = joint_q[problem, coord]
+    lo = lower[dof] + margins[dof]
+    hi = upper[dof] - margins[dof]
+    gradient = wp.float32(0.0)
+    if q < lo or q > hi:
+        gradient = weight
+    jacobian[problem, start_idx + dof, dof] = gradient
+
+
+class IKJointLimitBarrier(ik.IKObjectiveJointLimit):
+    """Squared-hinge IK cost near deploy limits, with an exact analytic Jacobian.
+
+    A residual is zero inside [lower + margin, upper - margin], and linear
+    outside that interval; least-squares IK makes the cost quadratic. Unlike
+    the stock joint-limit objective, this acts *before* reaching the stop.
+    """
+
+    def __init__(self, lower, upper, margins, weight):
+        super().__init__(lower, upper, weight)
+        self.margins = margins
+
+    def compute_residuals(self, body_q, joint_q, model, residuals, start_idx, problem_idx):
+        wp.launch(
+            _joint_barrier_residuals,
+            dim=(joint_q.shape[0], self.n_dofs),
+            inputs=[joint_q, self.joint_limit_lower, self.joint_limit_upper,
+                    self.margins, self.dof_to_coord, self.weight, start_idx],
+            outputs=[residuals], device=self.device,
+        )
+
+    def compute_jacobian_analytic(self, body_q, joint_q, model, jacobian, joint_S_s, start_idx):
+        wp.launch(
+            _joint_barrier_jacobian,
+            dim=(joint_q.shape[0], self.n_dofs),
+            inputs=[joint_q, self.joint_limit_lower, self.joint_limit_upper,
+                    self.margins, self.dof_to_coord, self.weight, start_idx],
+            outputs=[jacobian], device=self.device,
+        )
+
+
 class IKSmoothJointFilter(ik.IKObjective):
     """
     Smooth joint filter objective eases in penalization when joint gets close to

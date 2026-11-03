@@ -9,6 +9,7 @@ import soma_retargeter.utils.newton_utils as newton_utils
 import soma_retargeter.animation.ik as ik_utils
 import soma_retargeter.io.utils as utils
 import soma_retargeter.pipelines.utils as pipeline_utils
+from soma_retargeter.pipelines.ik_objectives import IKJointLimitBarrier
 
 _LIMB_DATA_IDX_EFFECTOR_INDICES = 0
 _LIMB_DATA_IDX_HINT_REF         = 1
@@ -59,11 +60,13 @@ def _root_correction_kernel(
 
 
 class LimbStabilizer:
-    def __init__(self, robot_type: str, active_human_ik_target_names: list[str], active_human_ik_mapped_indices: list[int], config: str | dict):
+    def __init__(self, robot_type: str, active_human_ik_target_names: list[str], active_human_ik_mapped_indices: list[int], config: str | dict,
+                 deploy_joint_limits=None):
         assert len(active_human_ik_target_names) > 0, "[ERROR]: At least one human IK target must be enabled."
         assert len(active_human_ik_target_names) == len(active_human_ik_mapped_indices), "[ERROR]: active_human_ik_target_names and active_human_ik_mapped_indices must have the same length."
 
         self._load_config(active_human_ik_target_names, active_human_ik_mapped_indices, config)
+        self.deploy_joint_limits = deploy_joint_limits
 
         self.robot_builder = pipeline_utils.create_robot_builder(robot_type)
         self.num_body_count = self.robot_builder.body_count
@@ -317,10 +320,14 @@ class LimbStabilizer:
                 )
 
         # Joint limit objective
-        self.joint_limit_objective = newton.ik.IKObjectiveJointLimit(
-            joint_limit_lower=self.ik_model.joint_limit_lower,
-            joint_limit_upper=self.ik_model.joint_limit_upper,
-            weight=self.joint_limit_weight)
+        if self.deploy_joint_limits is not None:
+            lower, upper, margins, weight = self.deploy_joint_limits
+            self.joint_limit_objective = IKJointLimitBarrier(lower, upper, margins, weight)
+        else:
+            self.joint_limit_objective = newton.ik.IKObjectiveJointLimit(
+                joint_limit_lower=self.ik_model.joint_limit_lower,
+                joint_limit_upper=self.ik_model.joint_limit_upper,
+                weight=self.joint_limit_weight)
 
         self.ik_solver = newton.ik.IKSolver(
             model=self.ik_model,
